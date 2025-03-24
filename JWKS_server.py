@@ -7,10 +7,23 @@ from cryptography.hazmat.backends import default_backend
 import jwt
 from urllib.parse import urlparse, parse_qs
 import base64
+import sqlite3
 
-keys = []
+# Database path
+DB_PATH = 'totally_not_my_privateKeys.db'
 
-#Create RSA key pair with a kid and expiry timestamp
+# Create database
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS keys
+                (kid INTEGER PRIMARY KEY AUTOINCREMENT,
+                key BLOB NOT NULL,
+                exp INTEGER NOT NULL)''')
+    conn.commit()
+    conn.close()
+
+# Create RSA key pair with a kid and expiry timestamp
 def generate_key_pair(expiry=None):
     private_key = rsa.generate_private_key(
         public_exponent=65537,
@@ -30,24 +43,24 @@ def generate_key_pair(expiry=None):
         format=serialization.PublicFormat.SubjectPublicKeyInfo
     )
 
-    #Create a key object
-    key_id = str(len(keys) + 1)
     expiry = expiry or (int(time.time()) + 3600)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (private_pem, expiry))
+    kid = c.lastrowid
+    conn.commit()
+    conn.close()
+
     key = {
-        "kid": key_id,
+        "kid": str(kid),
         "private_key": private_pem,
         "public_key": public_pem,
         "expiry": expiry,
         "public_numbers": public_key.public_numbers()
     }
-    keys.append(key)
     return key
 
-#Generate an initial valid key and an expired key
-generate_key_pair()  # Valid key
-generate_key_pair(expiry=int(time.time()) - 3600)  # Expired key
-
-#HTTP request handler
+# HTTP request handler
 class JWKSServer(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/.well-known/jwks.json"):
@@ -78,81 +91,84 @@ class JWKSServer(BaseHTTPRequestHandler):
         self.method_not_allowed()
 
     def method_not_allowed(self):
-        #Handle unsupported HTTP methods.
         self.send_response(405)
         self.send_header("Allow", "GET, POST")
         self.end_headers()
 
     def serve_jwks(self):
-        # Filter out expired keys for JWKS response
-        valid_keys = [key for key in keys if key["expiry"] > int(time.time())]
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT kid, key, exp FROM keys WHERE exp > ?", (int(time.time()),))
+        valid_keys = c.fetchall()
+        conn.close()
         
         jwks = {
             "keys": [
                 {
                     "kty": "RSA",
                     "use": "sig",
-                    "kid": key["kid"],
+                    "kid": str(key[0]),
                     "alg": "RS256",
                     "n": base64.urlsafe_b64encode(
-                        key["public_numbers"].n.to_bytes((key["public_numbers"].n.bit_length() + 7) // 8, byteorder="big")
+                        serialization.load_pem_private_key(key[1], password=None, backend=default_backend())
+                        .public_key().public_numbers().n.to_bytes((serialization.load_pem_private_key(key[1], password=None, backend=default_backend()).key_size + 7) // 8, byteorder="big")
                     ).decode("utf-8").rstrip("="),
                     "e": base64.urlsafe_b64encode(
-                        key["public_numbers"].e.to_bytes((key["public_numbers"].e.bit_length() + 7) // 8, byteorder="big")
+                        serialization.load_pem_private_key(key[1], password=None, backend=default_backend())
+                        .public_key().public_numbers().e.to_bytes((serialization.load_pem_private_key(key[1], password=None, backend=default_backend()).key_size + 7) // 8, byteorder="big")
                     ).decode("utf-8").rstrip("="),
                 }
                 for key in valid_keys
             ]
         }
-        
+
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(jwks).encode())
 
     def serve_auth(self):
-        #parse query parameters
         parsed_url = urlparse(self.path)
         query_params = parse_qs(parsed_url.query)
         
         expired = query_params.get("expired", ["false"])[0].lower() == "true"
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
 
-        #select key
         if expired:
-            #expired key
-            expired_keys = [key for key in keys if key["expiry"] <= int(time.time())]
-            if not expired_keys:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b"No expired keys available")
-                return
-            key = expired_keys[0]
-            exp_time = int(time.time()) - 3600 
+            c.execute("SELECT kid, key, exp FROM keys WHERE exp <= ? ORDER BY exp DESC LIMIT 1", (int(time.time()),))
         else:
-            #use valid key
-            valid_keys = [key for key in keys if key["expiry"] > int(time.time())]
-            if not valid_keys:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b"No valid keys available")
-                return
-            key = valid_keys[0]
-            exp_time = int(time.time()) + 3600
-        #create the JWT
+            c.execute("SELECT kid, key, exp FROM keys WHERE exp > ? ORDER BY exp ASC LIMIT 1", (int(time.time()),))
+        
+        key = c.fetchone()
+        conn.close()
+
+        if not key:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"No valid keys available")
+            return
+
+        private_key = serialization.load_pem_private_key(key[1], password=None, backend=default_backend())
+        
         payload = {
+            "sub": "1234567890",
             "name": "Chris Redfield",
-            "exp": exp_time,
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 3600,
         }
         
-        token = jwt.encode(payload, key["private_key"], algorithm="RS256", headers={"kid": key["kid"]})
+        token = jwt.encode(payload, private_key, algorithm="RS256", headers={"kid": str(key[0])})
 
-        #send reponse and token
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps({"token": token}).encode())
 
 if __name__ == "__main__":
+    init_db()
+    generate_key_pair()  # Valid key
+    generate_key_pair(expiry=int(time.time()) - 3600)  # Expired key
     server_address = ("", 8080)
     httpd = HTTPServer(server_address, JWKSServer)
     print("JWKS Server running on http://localhost:8080")
